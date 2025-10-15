@@ -20,7 +20,9 @@ setup(
     extras_require={},
     entry_points={
         'console_scripts': [
-            'surpass_stereo = surpass_stereo.surpass_stereo:main'
+            'surpass_stereo = surpass_stereo.surpass_stereo:main',
+            'calibrate_capture = surpass_stereo.stereo_calibrate:capture',
+            'us_registration = surpass_stereo.us_stereo_registration:main'
         ],
     },
 )
