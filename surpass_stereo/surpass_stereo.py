@@ -1,0 +1,118 @@
+import cv2 as cv
+import math
+import numpy as np
+import json
+
+class SurpassStereo:
+    def __init__(self, gstreamer_pipeline, config):
+        self.left_camera = cv.VideoCapture(gstreamer_pipeline(0), cv.CAP_GSTREAMER)
+        self.right_camera = cv.VideoCapture(gstreamer_pipeline(1), cv.CAP_GSTREAMER)
+
+        self.left_camera.set(cv.CAP_PROP_EXPOSURE, 20)
+        self.right_camera.set(cv.CAP_PROP_EXPOSURE, 20)
+
+        self.left_intrinsic = np.array(config["left_camera"]["intrinsic"])
+        self.right_intrinsic = np.array(config["right_camera"]["intrinsic"])
+
+        self.left_distortion = np.array(config["left_camera"]["distortion"])
+        self.right_distortion = np.array(config["right_camera"]["distortion"])
+
+        original_image_size = (1920, 1080)
+
+        R1, R2, P1, P2, Q, _, _ = cv.stereoRectify(
+            self.left_intrinsic,
+            self.left_distortion,
+            self.right_intrinsic,
+            self.right_distortion,
+            original_image_size,
+            np.array(config["rotation"]),
+            np.array(config["translation"])
+        )
+
+        self.left_rect = R1
+        self.right_rect = R2
+        self.left_proj = P1
+        self.right_proj = P2
+        self.disparity_to_depth = Q
+
+        self.left_mapx, self.left_mapy = cv.initUndistortRectifyMap(
+            self.left_intrinsic, self.left_distortion,
+            self.left_rect, self.left_proj,
+            original_image_size,
+            cv.CV_32F
+        )
+
+        self.right_mapx, self.right_mapy = cv.initUndistortRectifyMap(
+            self.right_intrinsic, self.right_distortion,
+            self.right_rect, self.right_proj,
+            original_image_size,
+            cv.CV_32F
+        )
+
+        fx = self.left_proj[0,0]
+        b = abs(np.array(config["translation"])[0])
+        min_depth = 0.04
+        max_disparity = math.ceil(fx*b/min_depth)
+        max_disparity = max_disparity - (max_disparity % 16) # required to be multiple of 16
+
+        block_size = 7
+        block_area = block_size * block_size
+        self.left_stereo_matcher = cv.StereoSGBM_create(0, max_disparity, block_size,
+                                                   8*3*block_area, 32*3*block_area,
+                                                   0, 0, 20,
+                                                   50, 1)
+
+        self.right_stereo_matcher = cv.ximgproc.createRightMatcher(self.left_stereo_matcher)
+        self.wls_filter = cv.ximgproc.createDisparityWLSFilter(self.left_stereo_matcher)
+        self.wls_filter.setLambda(8000.0)
+        self.wls_filter.setSigmaColor(0.6)
+
+    def compute_depth(self, left_image, right_image):
+        left_gray = cv.cvtColor(left_image, cv.COLOR_RGB2GRAY)
+        right_gray = cv.cvtColor(right_image, cv.COLOR_RGB2GRAY)
+        left_disparity = self.left_stereo_matcher.compute(left_gray, right_gray)
+        right_disparity = self.right_stereo_matcher.compute(right_gray, left_gray)
+
+        disparity = self.wls_filter.filter(left_disparity, left_gray, disparity_map_right=right_disparity, right_view=right_gray)
+        
+        disparity_debug = cv.ximgproc.getDisparityVis(disparity)
+        cv.imshow("disparity", disparity_debug)
+
+        #disparity.convertTo(disparity, CV_32F, 1.0f/cv::StereoMatcher::DISP_SCALE, 0.0f)
+
+    def run(self):
+        while True:
+            self.left_camera.grab()
+            self.right_camera.grab()
+    
+            ok, left_raw = self.left_camera.retrieve()
+            if not ok:
+                return
+
+            ok, right_raw = self.right_camera.retrieve()
+            if not ok:
+                return
+
+            left_image = cv.remap(left_raw, self.left_mapx, self.left_mapy, cv.INTER_LINEAR)
+            right_image = cv.remap(right_raw, self.right_mapx, self.right_mapy, cv.INTER_LINEAR)
+
+            depth = self.compute_depth(left_image, right_image)
+            key = cv.waitKey(30) 
+            key = key & 0xFF # Upper bits are modifiers (control, alt, etc.)
+            escape = 27
+            if key == ord('q') or key == escape:
+                break
+
+def main():
+    with open("share/dvrk_calibration.json") as f:
+        config = json.load(f)
+    
+    print(config)
+
+    diy_pipeline = lambda device: f"v4l2src device=/dev/video{device} ! image/jpeg,width=1920,height=1080,framerate=20/1 ! autovideoconvert ! appsink"
+    stereo = SurpassStereo(diy_pipeline, config)
+
+    stereo.run()
+
+if __name__ == '__main__':
+    main()
