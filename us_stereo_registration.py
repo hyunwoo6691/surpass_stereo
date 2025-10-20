@@ -14,7 +14,10 @@ class Tracker:
 
         self.Q = Q
 
-    def _to_3d(self, left_target, right_target):
+    def _to_3d(self, left_samples, right_samples):
+        left_target = np.mean(left_samples, axis=0)
+        right_target = np.mean(right_samples, axis=0)
+
         y_disp = abs(left_target[1] - right_target[1])
         if y_disp > 3:
             print("y-error:", abs(left_target[1] - right_target[1]))
@@ -34,8 +37,8 @@ class Tracker:
 
         print(len(self.left_targets), len(self.right_targets))
 
-        self.left_targets = sorted(self.left_targets, key=lambda t: t[1])
-        self.right_targets = sorted(self.right_targets, key=lambda t: t[1])
+        self.left_targets = sorted(self.left_targets, key=lambda t: (np.mean(t, axis=0))[1])
+        self.right_targets = sorted(self.right_targets, key=lambda t: (np.mean(t, axis=0))[1])
 
         self.targets = [
             self._to_3d(lt, rt) for lt, rt in zip(self.left_targets, self.right_targets)
@@ -61,22 +64,20 @@ class Tracker:
                 closest_distance = np.inf
                 closest_index = -1
                 for idx, t in enumerate(targets):
-                    dist = (t[0]-cx)**2 + (t[1]-cy)**2
+                    t_mean = np.mean(t, axis=0)
+                    dist = (t_mean[0]-cx)**2 + (t_mean[1]-cy)**2
                     if dist < closest_distance:
                         closest_distance = dist
                         closest_index = idx
 
                 if closest_distance > 35:
-                    targets.append((cx, cy))
+                    targets.append( [ (cx, cy) ] )
                 else:
-                    alpha = 0.8
-                    tcx, tcy = targets[closest_index]
-                    cx = alpha * tcx + (1-alpha) * cx
-                    cy = alpha * tcy + (1-alpha) * cy
-                    targets[closest_index] = (cx, cy)
+                    targets[closest_index].append((cx, cy))
 
         for target in targets:
-            cv.circle(image, (int(target[0]), int(target[1])), 4, (255,0,255), -1)
+            t_mean = np.mean(target, axis=0)
+            cv.circle(image, (int(t_mean[0]), int(t_mean[1])), 4, (255,0,255), -1)
 
         return thresh
 
@@ -121,7 +122,8 @@ def main():
         key = cv.waitKey(20) & 0xFF
         if key == 27 or key == ord('q'):
             print("Quitting...")
-            print(np.array(tracker.targets).tolist())
+            print()
+            print(json.dumps(np.array(tracker.targets).tolist()))
             break
 
 if __name__ == '__main__':
