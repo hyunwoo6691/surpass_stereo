@@ -1,6 +1,7 @@
 import numpy as np
 import cv2 as cv
 import glob
+import json
 from openigtl_stream import Streamer
 from surpass_stereo import SurpassStereo
 
@@ -45,6 +46,9 @@ def calibrate():
 
         left_image = cv.imread(fname)
         right_image = cv.imread(right_fname)
+
+        # calibration data was accidentally acquired with swapped cameras
+        left_image, right_image = right_image, left_image
 
         left_corners, left_annotated = find_and_annotate_chessboard(left_image)
         right_corners, right_annotated = find_and_annotate_chessboard(right_image)
@@ -99,21 +103,18 @@ def calibrate():
         "translation": T.tolist()
     }
 
-    print(result)
+    print(json.dumps(result))
 
     return result
 
 def capture():
     stereo = SurpassStereo.DIY(None)
-    #slicer_streamer = Streamer(port=18944)
-
     count = 0
-    
+
     cv.namedWindow("Calibration capture", cv.WINDOW_NORMAL)
 
     while True:
         ok, left_image, right_image = stereo.read()
-        gray = cv.cvtColor(left_image, cv.COLOR_BGR2GRAY)
 
         left_corners, left_annotated = find_and_annotate_chessboard(left_image)
         right_corners, right_annotated = find_and_annotate_chessboard(right_image)
@@ -121,7 +122,6 @@ def capture():
         ok = left_corners is not None and right_corners is not None
         annotated_image = np.hstack((left_annotated, right_annotated))
 
-        #slicer_streamer.send_image(annotated_image)
         cv.imshow("Calibration capture", annotated_image)
         key = cv.waitKey(20) & 0xFF
         if key == escape_key or key == ord('q'):

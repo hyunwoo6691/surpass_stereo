@@ -11,7 +11,7 @@ class SurpassStereo:
         self.left_camera = cv.VideoCapture(0, cv.CAP_V4L2)
         self.right_camera = cv.VideoCapture(2, cv.CAP_V4L2)
 
-        default_exposure = 100
+        default_exposure = 500
         self.left_camera.set(cv.CAP_PROP_EXPOSURE, default_exposure)
         self.right_camera.set(cv.CAP_PROP_EXPOSURE, default_exposure)
 
@@ -46,7 +46,8 @@ class SurpassStereo:
                 self.right_distortion,
                 original_image_size,
                 np.array(config["rotation"]),
-                np.array(config["translation"])
+                np.array(config["translation"]),
+                alpha=0
             )
 
             self.left_rect = R1
@@ -137,7 +138,7 @@ class SurpassStereo:
             if not ok:
                 print("!! Failed to read from stereo camera !!")
                 return
-            
+
             combined = np.hstack((left_image, right_image))
             cv.imshow("stereo", combined)
 
