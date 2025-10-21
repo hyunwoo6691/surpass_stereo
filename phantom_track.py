@@ -1,13 +1,14 @@
 import cv2 as cv
 import json
 import numpy as np
-from surpass_stereo import SurpassStereo
 import pyigtl
+from surpass_stereo import SurpassStereo
+import time
 
 
-def kabsch_alignment(self, points_a, points_b):
+def kabsch_alignment(points_a, points_b):
     """Computes rigid Procrustes alignment between points_a and points_b with known correspondence
-    
+
         points_a, points_a should be Nx3 arrays where the ith row of each represents the same point
         Computes 4x4 homogeneous transform T such that points_a[i, :] ~= T @ points_b[i, :]
     """
@@ -40,7 +41,7 @@ def kabsch_alignment(self, points_a, points_b):
     return T, mean_error
 
 class Tracker:
-    def __init__(self, Q, igtl_port):
+    def __init__(self, Q):
         self.phantom_pose = np.eye(4)
         self.Q = Q
 
@@ -60,7 +61,7 @@ class Tracker:
     def load(self, fiducials):
         self.fiducials = fiducials
 
-    def load_extrinsics(self, extrinsics)
+    def load_extrinsics(self, extrinsics):
         self.extrinsics = extrinsics
 
     def best_match(self, a, bs):
@@ -80,7 +81,7 @@ class Tracker:
 
     def find_targets(self, left_image, right_image):
         # Find all possible targets in left and right images
-        left_targts = self.find_targets_2d(left_image)
+        left_targets = self.find_targets_2d(left_image)
         right_targets = self.find_targets_2d(right_image)
 
         # Pair up targets with similar y-values
@@ -129,7 +130,7 @@ class Tracker:
         gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
         dark_spots = cv.adaptiveThreshold(gray, 255, cv.THRESH_BINARY_INV, cv.ADAPTIVE_THRESH_GAUSSIAN_C, 23, 25)
 
-        # rough segmentation of yellow phantom material 
+        # rough segmentation of yellow phantom material
         hsv = cv.cvtColor(image, cv.COLOR_BGR2HSV)
         lower = np.array([20, 0,   125], np.uint8)
         upper = np.array([40, 255, 255], np.uint8)
@@ -147,16 +148,16 @@ class Tracker:
         dark_spots = cv.morphologyEx(dark_spots, cv.MORPH_CLOSE, kernel)
 
         # debug visualization
-        debug = cv.cvtColor(thresh, cv.COLOR_GRAY2BGR)
+        debug = cv.cvtColor(dark_spots, cv.COLOR_GRAY2BGR)
 
         max_size = 150
         targets = []
-        contours, _ = cv.findContours(thresh, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv.findContours(dark_spots, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
         for contour in contours:
             area = cv.contourArea(contour)
             if area < 3 or area > max_size:
                 continue
-            
+
             M = cv.moments(contour)
             if M["m00"] <= 0.0:
                 continue
@@ -169,43 +170,40 @@ class Tracker:
         return targets
 
 
-def find_target(image):
-    contours, _ = cv.findContours(clean_mask, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE)
-    cv.drawContours(image, contours, -1, (0,255,0), 3)
-
-    if len(contours) > 0:
-        target = max(contours, key = cv.contourArea)
-        cv.drawContours(image, [target], -1, (0,255,255), 5)
-
-    cv.imshow("target mask", clean_mask)
-    cv.imshow("target contours", image)
-
-
 last_us_fiducial = None
 def get_us_fiducial(igtl_server):
     # Get updated US fiducial position
-    global us_fiducial
+    global last_us_fiducial
     messages = igtl_server.get_latest_messages()
     for msg in messages[:-1:]:
-        if msg.device_name = "US/fiducial":
+        if msg.device_name == "US/fiducial":
             last_us_fiducial = msg.positions[0]
             break
 
     return last_us_fiducial
 
 
-def scan(tracker, igtl_server):
+def scan(stereo, tracker, igtl_server):
     cv.namedWindow("Scanning", cv.WINDOW_NORMAL)
 
     markers = []
     while True:
-        us_fiducial = tracker.extrinsics @ get_us_fiducial(igtl_server)
+        us_fiducial = get_us_fiducial(igtl_server)
+        if us_fiducial is None:
+            print("No fiducial position from PA-US module")
+            cv.waitKey(1000)
+            continue
+
+        us_fiducial = tracker.extrinsics @ us_fiducial
 
         ok, left, right = stereo.read()
         targets_3d = tracker.find_targets(left, right)
         print(targets_3d)
         print(us_fiducial)
-        markers = [ targets_3d[0], targets_3d[1], us_fiducial ]
+        d_s = 0.5*targets_3d[0][2] + 0.5*targets_3d[1][2]
+        d = np.array([0.0, 0.0, d_s])
+        markers = [ targets_3d[0], targets_3d[1], us_fiducial + d ]
+        print(f"d_s = {d_s}")
 
         image = np.hstack((left, right))
         cv.imshow("Scanning markers", image)
@@ -217,17 +215,21 @@ def scan(tracker, igtl_server):
     np.savetxt("marker_positions.txt", markers)
 
 
-def track(tracker, server):
+def track(stereo, tracker, server):
     cv.namedWindow("Tracking", cv.WINDOW_NORMAL)
 
     while True:
-        us_fiducial = tracker.extrinsics @ get_us_fiducial(igtl_server)
+        us_fiducial = tracker.extrinsics @ get_us_fiducial(server)
+        if us_fiducial is None:
+            print("No fiducial position from PA-US module")
+            time.sleep(1.0)
+            continue
 
         ok, left, right = stereo.read()
         estimated_pose = tracker.update(left, right, us_fiducial)
-        print(estimate_pose)
+        print(estimated_pose)
 
-        if estimate_pose is not None:
+        if estimated_pose is not None:
             transform_message = pyigtl.TransformMessage(estimated_pose, device_name="phantom_to_stereo")
             server.send_message(transform_message)
 
@@ -255,17 +257,18 @@ def main():
     stereo = SurpassStereo.DIY(config)
     stereo.set_exposure(25)
 
+    igtl_port = 18959
     igtl_server = pyigtl.OpenIGTLinkServer(port=igtl_port)
 
-    tracker = Tracker(stereo.disparity_to_depth, igtl_port=18959)
+    tracker = Tracker(stereo.disparity_to_depth)
     extrinsics = np.loadtxt("stereo_to_us_extrinsics.txt")
-    target.load_extrinsics(extrinsics)
+    tracker.load_extrinsics(extrinsics)
 
     # fiducials = np.loadtxt("marker_positions.txt")
     # tracker.load(fiducials)
     # track(tracker, igtl_server)
 
-    scan(tracker, igtl_server)
+    scan(stereo, tracker, igtl_server)
 
 
 if __name__ == '__main__':
