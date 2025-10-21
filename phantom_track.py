@@ -60,6 +60,9 @@ class Tracker:
     def load(self, fiducials):
         self.fiducials = fiducials
 
+    def load_extrinsics(self, extrinsics)
+        self.extrinsics = extrinsics
+
     def best_match(self, a, bs):
         closest_idx = None
         closest_distance = np.inf
@@ -194,13 +197,15 @@ def get_us_fiducial(igtl_server):
 def scan(tracker, igtl_server):
     cv.namedWindow("Scanning", cv.WINDOW_NORMAL)
 
+    markers = []
     while True:
-        us_fiducial = get_us_fiducial(igtl_server)
+        us_fiducial = tracker.extrinsics @ get_us_fiducial(igtl_server)
 
         ok, left, right = stereo.read()
         targets_3d = tracker.find_targets(left, right)
         print(targets_3d)
         print(us_fiducial)
+        markers = [ targets_3d[0], targets_3d[1], us_fiducial ]
 
         image = np.hstack((left, right))
         cv.imshow("Scanning markers", image)
@@ -209,12 +214,14 @@ def scan(tracker, igtl_server):
             print("Quitting...")
             break
 
+    np.savetxt("marker_positions.txt", markers)
 
-def track():
+
+def track(tracker, server):
     cv.namedWindow("Tracking", cv.WINDOW_NORMAL)
 
     while True:
-        us_fiducial = get_us_fiducial(igtl_server)
+        us_fiducial = tracker.extrinsics @ get_us_fiducial(igtl_server)
 
         ok, left, right = stereo.read()
         estimated_pose = tracker.update(left, right, us_fiducial)
@@ -251,7 +258,10 @@ def main():
     igtl_server = pyigtl.OpenIGTLinkServer(port=igtl_port)
 
     tracker = Tracker(stereo.disparity_to_depth, igtl_port=18959)
-    # fiducials = np.loadtxt("poses.txt")
+    extrinsics = np.loadtxt("stereo_to_us_extrinsics.txt")
+    target.load_extrinsics(extrinsics)
+
+    # fiducials = np.loadtxt("marker_positions.txt")
     # tracker.load(fiducials)
     # track(tracker, igtl_server)
 
