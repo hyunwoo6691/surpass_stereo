@@ -1,9 +1,10 @@
+import argparse
 import cv2 as cv
+import collections
 import json
 import numpy as np
 import pyigtl
 from surpass_stereo import SurpassStereo
-import time
 
 
 def kabsch_alignment(points_a, points_b):
@@ -17,15 +18,14 @@ def kabsch_alignment(points_a, points_b):
     centroid_b = np.mean(points_b, axis=0)
 
     # Translate points so centroid is at origin
-    points_a -= centroid_a
-    points_b -= centroid_b
-
-    H = points_a.T @ points_b
+    A = points_a - centroid_a
+    B = points_b - centroid_b
+    H = A.T @ B
 
     U, S, Vt = np.linalg.svd(H)
 
-    d = np.linalg.det(U) * np.linalg.norm(Vt)
-    d = 10 if d > 0.0 else -1.0
+    d = np.linalg.det(U) * np.linalg.det(Vt)
+    d = 1.0 if d > 0.0 else -1.0
 
     S = np.diag(np.array([1.0, 1.0, d]))
     R = U @ S @ Vt
@@ -36,14 +36,15 @@ def kabsch_alignment(points_a, points_b):
     T[0:3, 0:3] = R
     T[0:3, 3] = t
 
-    errors = (points_a.T - T @ points_b.T).T
+    errors = (points_a.T - (R @ points_b.T + t[:,np.newaxis])).T
     mean_error = np.mean([np.linalg.norm(errors[k, :]) for k in range(errors.shape[0])])
     return T, mean_error
 
 class Tracker:
-    def __init__(self, Q):
+    def __init__(self, Q, averaging_window=2):
         self.phantom_pose = np.eye(4)
         self.Q = Q
+        self.optical_targets = collections.deque(maxlen=averaging_window)
 
     def _to_3d(self, left_target, right_target):
         y_disp = abs(left_target[1] - right_target[1])
@@ -59,7 +60,8 @@ class Tracker:
         return np.array([P[0], P[1], P[2]], dtype=np.float32)
 
     def load(self, fiducials):
-        self.fiducials = fiducials
+        self.fiducials = fiducials[0:3, :]
+        self.d = fiducials[3, :]
 
     def load_extrinsics(self, extrinsics):
         self.extrinsics = extrinsics
@@ -81,8 +83,8 @@ class Tracker:
 
     def find_targets(self, left_image, right_image):
         # Find all possible targets in left and right images
-        left_targets = self.find_targets_2d(left_image)
-        right_targets = self.find_targets_2d(right_image)
+        left_targets = self.find_targets_2d(left_image, "left")
+        right_targets = self.find_targets_2d(right_image, "right")
 
         # Pair up targets with similar y-values
         valid_targets = []
@@ -107,8 +109,10 @@ class Tracker:
 
         return targets_3d
 
-    def update(self, left_image, right_image, us_fiducial):
+    def update(self, left_image, right_image, pa_fiducial):
         targets_3d = self.find_targets(left_image, right_image)
+
+        pa_fiducial_in_stereo_frame = self.extrinsics[0:3, 0:3] @ (pa_fiducial + self.d) + self.extrinsics[0:3, 3]
 
         if len(targets_3d) < 2:
             print(f"Only found {len(targets_3d)} optical targets, please make sure markers are visible")
@@ -118,44 +122,71 @@ class Tracker:
             return None
 
         a, b = targets_3d[0], targets_3d[1]
-        pose_one, error_one = kabsch_alignment([a, b, us_fiducial])
-        pose_two, error_two = kabsch_alignment([b, a, us_fiducial])
+
+        pose_one, error_one = kabsch_alignment(self.fiducials, np.array([a, b, pa_fiducial_in_stereo_frame]))
+        pose_two, error_two = kabsch_alignment(self.fiducials, np.array([b, a, pa_fiducial_in_stereo_frame]))
         if error_one <= error_two:
+            print(error_one, error_two)
+            print(np.array([a, b, pa_fiducial_in_stereo_frame]))
             return pose_one
         else:
+            print(error_two, error_one)
+            print(np.array([b, a, pa_fiducial_in_stereo_frame]))
             return pose_two
 
-    def find_targets_2d(self, image):
+    def find_targets_2d(self, image, debug_name=""):
         # identify dark spots in image via adaptive thresholding
         gray = cv.cvtColor(image, cv.COLOR_BGR2GRAY)
-        dark_spots = cv.adaptiveThreshold(gray, 255, cv.THRESH_BINARY_INV, cv.ADAPTIVE_THRESH_GAUSSIAN_C, 23, 25)
+        gray = cv.medianBlur(gray, 5)
+        dark_spots = cv.adaptiveThreshold(gray, 255, cv.THRESH_BINARY_INV, cv.ADAPTIVE_THRESH_GAUSSIAN_C, 31, 20)
+        # close small holes in dark spot mask (sometimes middle of dark spot is missed)
+        kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (7, 7))
+        dark_spots = cv.morphologyEx(dark_spots, cv.MORPH_CLOSE, kernel, iterations=2)
+
+        #debug_dark_spots = cv.resize(dark_spots, (640, 480))
+        #cv.imshow(f"{debug_name}/dark_spots", debug_dark_spots)
 
         # rough segmentation of yellow phantom material
         hsv = cv.cvtColor(image, cv.COLOR_BGR2HSV)
-        lower = np.array([20, 0,   125], np.uint8)
-        upper = np.array([40, 255, 255], np.uint8)
+        lower = np.array([20, 0,   50], np.uint8)
+        upper = np.array([115, 255, 255], np.uint8)
         background = cv.inRange(hsv, lower, upper)
 
         # close small-to-medium holes in background mask
         kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (11, 11))
         background = cv.morphologyEx(background, cv.MORPH_CLOSE, kernel, iterations=2)
+        contours, _ = cv.findContours(background, mode=cv.RETR_EXTERNAL, method=cv.CHAIN_APPROX_SIMPLE)
+        contours = sorted(contours, key=cv.contourArea, reverse=True)
+
+        # replace background mask with filled-in largest contour
+        background = np.zeros_like(background, dtype=background.dtype)
+        if len(contours) > 0 or cv.contourArea(contours[0]) < 500:
+            cv.drawContours(background, [contours[0]], 0, color=(255, 255, 255), thickness=cv.FILLED)
+
+        # shrink contour mask away from edges
+        kernel = cv.getStructuringElement(cv.MORPH_RECT, (13, 13))
+        background = cv.morphologyEx(background, cv.MORPH_ERODE, kernel, iterations=3)
+
+        #cv.imshow(f"{debug_name}/background", background)
 
         # keep only dark spots inside background mask
-        dark_spots = cv.bitwise_and(dark_spots, background)
-
-        # close small holes in dark spot mask (sometimes middle of dark spot is missed)
+        mask = cv.bitwise_and(dark_spots, background)
+        kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (9, 9))
+        mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel, iterations=3)
         kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (5, 5))
-        dark_spots = cv.morphologyEx(dark_spots, cv.MORPH_CLOSE, kernel)
+        mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel, iterations=2)
+
+        #cv.imshow(f"{debug_name}/mask", mask)
 
         # debug visualization
-        debug = cv.cvtColor(dark_spots, cv.COLOR_GRAY2BGR)
+        #debug = cv.cvtColor(dark_spots, cv.COLOR_GRAY2BGR)
 
-        max_size = 150
         targets = []
-        contours, _ = cv.findContours(dark_spots, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-        for contour in contours:
-            area = cv.contourArea(contour)
-            if area < 3 or area > max_size:
+        contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+        contours = [(c, cv.contourArea(c)) for c in contours]
+        contours = sorted(contours, key=lambda d: d[1], reverse=True)
+        for contour, area in contours:
+            if area < 5:
                 continue
 
             M = cv.moments(contour)
@@ -165,47 +196,72 @@ class Tracker:
             cx = int(M["m10"]/M["m00"])
             cy = int(M["m01"]/M["m00"])
 
+            # # skip small marks near existing targets
+            # for tx, ty in targets:
+            #     if np.linalg.norm([tx - cx, ty - cy]) < 20:
+            #         continue
+
             targets.append((cx, cy))
+            #cv.circle(image, (cx, cy), 5, (0,0,255), -1)
 
         return targets
 
 
 last_us_fiducial = None
-def get_us_fiducial(igtl_server):
+def get_us_fiducial(igtl_fiducial_client: pyigtl.OpenIGTLinkClient):
     # Get updated US fiducial position
     global last_us_fiducial
-    messages = igtl_server.get_latest_messages()
-    for msg in messages[:-1:]:
-        if msg.device_name == "US/fiducial":
-            last_us_fiducial = msg.positions[0]
-            break
+    messages = igtl_fiducial_client.get_latest_messages()
+    for msg in messages[::-1]:
+        if msg.device_name == "paFiducial":
+            if not np.isnan(msg.positions[0][1]):
+                last_us_fiducial = np.array(msg.positions[0]) * 0.001
+                break
 
     return last_us_fiducial
 
 
-def scan(stereo, tracker, igtl_server):
-    cv.namedWindow("Scanning", cv.WINDOW_NORMAL)
+def scan(stereo, tracker, igtl_fiducial_client):
+    cv.namedWindow("Scanning markers", cv.WINDOW_NORMAL)
 
     markers = []
     while True:
-        us_fiducial = get_us_fiducial(igtl_server)
-        if us_fiducial is None:
+        pa_fiducial = get_us_fiducial(igtl_fiducial_client)
+        if pa_fiducial is None:
             print("No fiducial position from PA-US module")
             cv.waitKey(1000)
             continue
 
-        us_fiducial = tracker.extrinsics @ us_fiducial
-
         ok, left, right = stereo.read()
+        if not ok:
+            print("Could not access stereo camera - is it unplugged?")
+            cv.waitKey(1000)
+            continue
+
         targets_3d = tracker.find_targets(left, right)
-        print(targets_3d)
-        print(us_fiducial)
-        d_s = 0.5*targets_3d[0][2] + 0.5*targets_3d[1][2]
-        d = np.array([0.0, 0.0, d_s])
-        markers = [ targets_3d[0], targets_3d[1], us_fiducial + d ]
-        print(f"d_s = {d_s}")
+        if len(targets_3d) == 2:
+            if len(markers) == 0:
+                markers.append(targets_3d)
+            else:
+                dist_1 = np.linalg.norm(targets_3d[0] - markers[0][0])
+                dist_2 = np.linalg.norm(targets_3d[0] - markers[0][1])
+                if dist_2 > dist_1:
+                    targets_3d[0], targets_3d[1] = targets_3d[1], targets_3d[0]
+                
+                markers.append(targets_3d)
+
+            d = tracker.extrinsics[0:3, 0:3].T @ (0.5*(targets_3d[0] + targets_3d[1]) - tracker.extrinsics[0:3, 3])
+            d_s = d[2]
+            d = np.array([0.0, 0.0, d_s])
+
+            pa_fiducial_in_stereo_frame = tracker.extrinsics[0:3, 0:3] @ (pa_fiducial + d) + tracker.extrinsics[0:3, 3]
+            markers = [ targets_3d[0], targets_3d[1], pa_fiducial_in_stereo_frame ]
+            print(markers)
+            print(f"d_s = {d_s}")
+            print()
 
         image = np.hstack((left, right))
+        image = cv.resize(image, (1280, 480))
         cv.imshow("Scanning markers", image)
         key = cv.waitKey(40) & 0xFF
         if key == 27 or key == ord('q'):
@@ -215,23 +271,34 @@ def scan(stereo, tracker, igtl_server):
     np.savetxt("marker_positions.txt", markers)
 
 
-def track(stereo, tracker, server):
+def track(stereo, tracker, igtl_fiducial_client: pyigtl.OpenIGTLinkClient, igtl_pose_server:pyigtl.OpenIGTLinkServer):
     cv.namedWindow("Tracking", cv.WINDOW_NORMAL)
 
     while True:
-        us_fiducial = tracker.extrinsics @ get_us_fiducial(server)
-        if us_fiducial is None:
+        pa_fiducial = get_us_fiducial(igtl_fiducial_client)
+        if pa_fiducial is None:
             print("No fiducial position from PA-US module")
-            time.sleep(1.0)
+            cv.waitKey(1000)
             continue
 
         ok, left, right = stereo.read()
-        estimated_pose = tracker.update(left, right, us_fiducial)
+        if not ok:
+            print("Could not access stereo camera - is it unplugged?")
+            cv.waitKey(1000)
+            continue
+
+        estimated_pose = tracker.update(left, right, pa_fiducial)
         print(estimated_pose)
 
-        if estimated_pose is not None:
-            transform_message = pyigtl.TransformMessage(estimated_pose, device_name="phantom_to_stereo")
-            server.send_message(transform_message)
+        if igtl_pose_server.is_connected():
+            image_messaage = opencv_to_igtl(left)
+            igtl_pose_server.send_message(image_messaage)
+
+            if estimated_pose is not None:
+                print('Sending to client')
+                estimated_pose[0:3, 3] *= 1.0e3
+                transform_message = pyigtl.TransformMessage(estimated_pose, device_name="phantom_to_stereo")
+                igtl_pose_server.send_message(transform_message, wait=True)
 
         image = np.hstack((left, right))
         cv.imshow("Tracking", image)
@@ -241,7 +308,7 @@ def track(stereo, tracker, server):
             break
 
 
-def opencv_to_igtl(self, image: cv.Mat, device_name="stereo_image") -> pyigtl.ImageMessage:
+def opencv_to_igtl(image: cv.Mat, device_name="stereo_image") -> pyigtl.ImageMessage:
     """Converts OpenCV image (BGR) to OpenIGTL ImageMessage"""
     image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
     image = np.flipud(image)
@@ -255,20 +322,25 @@ def main():
         config = json.load(f)
 
     stereo = SurpassStereo.DIY(config)
-    stereo.set_exposure(25)
+    stereo.set_exposure(250)
 
     igtl_port = 18959
-    igtl_server = pyigtl.OpenIGTLinkServer(port=igtl_port)
+    igtl_fiducial_client = pyigtl.OpenIGTLinkClient(port=igtl_port)
 
-    tracker = Tracker(stereo.disparity_to_depth)
-    extrinsics = np.loadtxt("stereo_to_us_extrinsics.txt")
+    igtl_pose_server = pyigtl.OpenIGTLinkServer(port=18946)
+
+    tracker = Tracker(stereo.disparity_to_depth, averaging_window=25)
+    extrinsics = np.loadtxt("galvo_to_stereo_extrinsics.txt")
     tracker.load_extrinsics(extrinsics)
 
-    # fiducials = np.loadtxt("marker_positions.txt")
-    # tracker.load(fiducials)
-    # track(tracker, igtl_server)
+    tracking = True
 
-    scan(stereo, tracker, igtl_server)
+    if tracking:
+        fiducials = np.loadtxt("fiducials.txt")
+        tracker.load(fiducials)
+        track(stereo, tracker, igtl_fiducial_client, igtl_pose_server)
+    else:
+        scan(stereo, tracker, igtl_fiducial_client)
 
 
 if __name__ == '__main__':

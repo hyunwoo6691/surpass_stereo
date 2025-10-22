@@ -75,7 +75,6 @@ class SurpassStereo:
             min_depth = 0.04
             max_disparity = math.ceil(fx*b/min_depth)
             max_disparity = max_disparity - (max_disparity % 16) # required to be multiple of 16
-            print("Max disparity:", max_disparity)
 
             block_size = 7
             block_area = block_size * block_size
